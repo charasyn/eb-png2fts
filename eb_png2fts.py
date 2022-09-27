@@ -36,6 +36,24 @@ class EbPalette:
         im = im.resize((16*8, 6*8), resample=Image.NEAREST)
         return im
 
+    def from_image(self, image):
+        """Loads the palette from an image representation"""
+        def get_color(im):
+            colors = im.getcolors(1)
+            assert colors, "Palette image must be 8x8 blocks of solid color"
+            return colors[0][1]
+        assert image.width == 16*8
+        assert image.height == 6*8
+        color_images = image_cropper.get_tiles(image, tile_size=8)
+        self.subpalettes = [[] for _ in range(6)]
+        for index, im_color in enumerate(color_images):
+            ypos = index // 16
+            xpos = index % 16
+            if xpos == 0:
+                continue
+            color = get_color(im_color)
+            self.subpalettes[ypos].append(color)
+
     def fts_string(self, area_id):
         """Returns the .fts string representation of the palette"""
         palette_str = BASE32_DIGITS[area_id] + '0' # Area, palette 0
@@ -155,6 +173,10 @@ class EbTileset:
         # Data set prior to calling compute()
         self.chunk_tile_images = []
         self.tile_palettes = []
+        self.tile_positions = []
+        self.map_values = None
+        self.map_width = None
+        self.palette_provided = False
 
         # Data set by compute()
         self.tile_index = 0 # Index for next unique tile
@@ -163,36 +185,65 @@ class EbTileset:
         self.tiles = []
         self.palette = EbPalette()
         self.tile_dict = dict()
-        self._chunk_image_cache = set()
+        self._chunk_image_cache = dict()
+
+    def load_palette(self, image):
+        self.palette.from_image(image)
+        self.palette_provided = True
 
     def append_from_image(self, image):
         """Adds unique chunks and tiles from an image into the tileset"""
         chunk_images = image_cropper.get_tiles(image, tile_size=32)
+        # Equivalent of ceil(image.width / 32)
+        self.map_width = (image.width + 31) // 32
+        self.map_values = []
 
-        for im_chunk in chunk_images:
-            if im_chunk.tobytes() in self._chunk_image_cache:
+        for chunk_idx, im_chunk in enumerate(chunk_images):
+            new_chunk_image = False
+            im_chunk_bytes = im_chunk.tobytes()
+            if im_chunk_bytes not in self._chunk_image_cache:
+                chunk_map_value = len(self._chunk_image_cache)
+                self._chunk_image_cache[im_chunk_bytes] = chunk_map_value
+                new_chunk_image = True
+            self.map_values.append(self._chunk_image_cache[im_chunk_bytes])
+            if not new_chunk_image and not self.palette_provided:
+                # When we've provided a palette, we need to have accurate
                 continue
-
-            self._chunk_image_cache.add(im_chunk.tobytes())
 
             tile_images = image_cropper.get_tiles(im_chunk, tile_size=8)
             self.chunk_tile_images.append(tile_images)
-            for im_tile in tile_images:
+            for tile_in_chunk, im_tile in enumerate(tile_images):
                 colors = im_tile.getcolors(15) # (count, (r,g,b))
                 if colors is None:
                     raise PaletteError('A single tile had more than 15 colors.')
 
                 colors = [rgb for _, rgb in colors] # Discard pixel count
                 self.tile_palettes.append(colors)
+                tile_x = (chunk_idx %  self.map_width) * 32 + (tile_in_chunk %  4) * 8
+                tile_y = (chunk_idx // self.map_width) * 32 + (tile_in_chunk // 4) * 8
+                self.tile_positions.append((tile_x, tile_y))
 
     def compute(self):
-        # Use palettepacker library to perform better packing of
-        # palettes into subpalettes
-        packedSubpalettes, subpalette_map = \
-            palettepacker.tilePalettesToSubpalettes(self.tile_palettes)
-        assert(len(packedSubpalettes) <= 6)
-        # Keep the length of subpalettes the same
-        self.palette.subpalettes[:len(packedSubpalettes)] = packedSubpalettes
+        if self.palette_provided:
+            subpalette_map = []
+            our_palettes = [frozenset(pal) for pal in self.palette.subpalettes]
+            for tile_pal, tile_pos in zip(self.tile_palettes, self.tile_positions):
+                tile_pal_set = frozenset(tile_pal)
+                for pal_idx, potential_pal in enumerate(our_palettes):
+                    if tile_pal_set.issubset(potential_pal):
+                        subpalette_map.append(pal_idx)
+                        break
+                else:
+                    tile_x, tile_y = tile_pos
+                    raise PaletteError("Palette file is not valid for tile at ({},{})".format(tile_x, tile_y))
+        else:
+            # Use palettepacker library to perform better packing of
+            # palettes into subpalettes
+            packedSubpalettes, subpalette_map = \
+                palettepacker.tilePalettesToSubpalettes(self.tile_palettes)
+            assert(len(packedSubpalettes) <= 6)
+            # Keep the length of subpalettes the same
+            self.palette.subpalettes[:len(packedSubpalettes)] = packedSubpalettes
 
         for chunk_idx, tile_images in enumerate(self.chunk_tile_images):
             chunk_tiles = []
@@ -280,9 +331,28 @@ class EbTileset:
             for i in range(len(self.chunks), 1024):
                 fts_file.write(f'{blank_chunk_str}\n')
 
+    def to_map(self, filepath):
+        with open(filepath, 'w', encoding='utf-8', newline='\n') as map_file:
+            map_line = []
+            for val in self.map_values:
+                map_line.append(val)
+                if len(map_line) == self.map_width:
+                    print(' '.join('{:03x}'.format(x) for x in map_line), file=map_file)
+                    map_line.clear()
+            assert not map_line, "Internal coding error"
 
 def main(args):
+    if len(args.input_files) > 1 and args.output_map:
+        print('WARNING: Multiple input files have been specified.')
+        print('Only the map for the last input file will be saved.')
     tileset = EbTileset(args.tileset_id)
+
+    if args.palette:
+        with Image.open(args.palette) as image:
+            image = image.convert(mode='RGB') # Get rid of the alpha channel
+            image = ImageOps.posterize(image, 5) # 5-bit color
+
+            tileset.load_palette(image)
 
     for path in args.input_files:
         with Image.open(path) as image:
@@ -297,7 +367,17 @@ def main(args):
     print(f'{len(tileset.chunks)} chunks!')
     print(f'{len(tileset.tiles)} unique tiles!')
 
+    if args.output_palette:
+        print('Writing palette...')
+        palette_image = tileset.palette.to_image()
+        palette_image.save(args.output_palette)
+
+    print('Writing FTS...')
     tileset.to_fts(args.output)
+
+    if args.output_map:
+        print('Writing map...')
+        tileset.to_map(args.output_map)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Convert image files into CoilSnake-compatible files for Earthbound hacking')
@@ -305,6 +385,9 @@ if __name__ == '__main__':
     parser.add_argument('input_files', metavar='IN_IMAGE', nargs='+', help='Input image files')
     parser.add_argument('-t', '--tileset-id', required=True, type=int, metavar='[0-19]', choices=range(20), help='Specify the tileset ID')
     parser.add_argument('-o', '--output', required=True, help='Output FTS file')
+    parser.add_argument('-m', '--output-map', help='Output .map file containing chunk indices')
+    parser.add_argument('-p', '--palette', help='Palette image file to use as the tileset\'s palette')
+    parser.add_argument('--output-palette', help='Output palette as image file')
     args = parser.parse_args()
 
     from time import perf_counter
