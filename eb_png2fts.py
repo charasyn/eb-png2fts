@@ -146,7 +146,7 @@ class EbTile:
 
     def fts_string(self):
         """Returns the .fts string representation of the tile"""
-        return ''.join(HEX_DIGITS[pixel] for pixel in self.data)
+        return ''.join(''.join(HEX_DIGITS[pixel] for pixel in row) for row in self.data)
 
 
 class EbChunk:
