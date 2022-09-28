@@ -301,7 +301,12 @@ class EbTileset:
                     tile_h = tile.flipped_h()
                     tile_v = tile.flipped_v()
                     tile_hv = tile.flipped_hv()
-                    self.all_tile_data.update({t.data: t for t in (tile, tile_h, tile_v, tile_hv)})
+                    # Need to put these in reverse order - if tile is the same
+                    # when rotated then we want to use the non-rotated version.
+                    # This prevents us from having two different chunks that look identical,
+                    # because one of them has flipped 8x8 tiles.
+                    for t in (tile_hv, tile_h, tile_v, tile):
+                        self.all_tile_data[t.data] = t
                     self.tiles.append(tile)
                 else:
                     # Perform a shallow copy of the tile so we can change its metadata
