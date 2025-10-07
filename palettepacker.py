@@ -113,7 +113,7 @@ def _approximatePalettes(paletteData):
         break
     return frozenset(donepals | pals)
 
-def _simulatedAnnealing(paletteData, approximation):
+def _simulatedAnnealing(paletteData, approximation, sharedTilePalettes=None):
     # Get the parameters class from earlier on in the file for easier reference.
     params = _AnnealingParameters
 
@@ -131,7 +131,7 @@ def _simulatedAnnealing(paletteData, approximation):
         return frozenset(mergePaletteIndices(pidxs) for pidxs in s)
 
     @lru_cache
-    def EFromPalettes(sp):
+    def EFromPalettes(s, sp):
         e = 0
         # For each subpalette, calculate the energy resulting from that
         # subpalette. (Lower is better, annealing algo. minimizes this energy)
@@ -146,11 +146,23 @@ def _simulatedAnnealing(paletteData, approximation):
             # Fee for each colour over max - incentivizes staying within colour limit
             if l > MAX_COLOURS:
                 e += 50 * (l - MAX_COLOURS)
+        if sharedTilePalettes:
+            # Check shared tile palettes, these should be in different palettes
+            for row in s:
+                numInThisRow = 0
+                for paletteGroup in sharedTilePalettes:
+                    numInThisRowGroup = sum(1 for pidx in paletteGroup if pidx in row)
+                    if numInThisRowGroup > 1:
+                        numInThisRow += numInThisRowGroup - 1
+                # Fee for having multiple palettes from the same group in the same row
+                # Incentivizes splitting shared tile palettes into different rows,
+                # which will allow us to reuse the same tile data for different palettes
+                e += 50 * numInThisRow
         return e
 
     def E(s):
         sp = palettesFromState(s)
-        return EFromPalettes(sp)
+        return EFromPalettes(s, sp)
 
     def neighbour(s, rng):
         # Move one tile palette from one subpalette to another, to create
@@ -243,7 +255,7 @@ def _simulatedAnnealing(paletteData, approximation):
                 Es = Esnew
     return sorted(palettesFromState(bestS), key=lambda p: -len(p))
 
-def tilePalettesToSubpalettes(paletteData):
+def tilePalettesToSubpalettes(paletteData, sharedTilePalettes=None):
     '''
     Given a list of tile palettes, this function will fit them into subpalettes
     and return both the subpalettes and the mapping from the index into the
@@ -271,20 +283,15 @@ def tilePalettesToSubpalettes(paletteData):
     )
     '''
     # Perform initial palette deduplication
-    paletteDataDedup = set(frozenset(tilePal) for tilePal in paletteData)
-    duplicatesToRemove = set()
-    for pal1 in paletteDataDedup:
-        for pal2 in paletteDataDedup:
-            if pal1 == pal2:
-                continue
-            if pal1.issubset(pal2):
-                duplicatesToRemove.add(pal1)
-                break
-    paletteDataDedup -= duplicatesToRemove
-    paletteDataInternal = list(paletteDataDedup)
+    # Actually, let's try not doing this.
+    paletteDataInternal = [frozenset(pal) for pal in paletteData]
+    if sharedTilePalettes:
+        sharedTilePalettesInternal = set(frozenset(stpRow) for stpRow in sharedTilePalettes)
+    else:
+        sharedTilePalettesInternal = None
     # Perform our packing algorithm in two steps
     approx = _approximatePalettes(paletteDataInternal)
-    finalSubpalettesSet = _simulatedAnnealing(paletteDataInternal, approx)
+    finalSubpalettesSet = _simulatedAnnealing(paletteDataInternal, approx, sharedTilePalettesInternal)
     if any(len(subPal) > MAX_COLOURS for subPal in finalSubpalettesSet):
         raise UnsolvableException("Unable to find a solution")
     # Calculate the subpalette index for each input palette
@@ -298,8 +305,8 @@ def tilePalettesToSubpalettes(paletteData):
             assert False, "This should never happen"
     return ([sorted(pal) for pal in finalSubpalettesSet], tileToSubpaletteMap)
 
-def _verifyTestData(inputs, expectedSubpalettes, expectedMapping):
-    resultSubpalettes, resultMapping = tilePalettesToSubpalettes(inputs)
+def _verifyTestData(inputs, expectedSubpalettes, expectedMapping, sharedTilePalettes=None):
+    resultSubpalettes, resultMapping = tilePalettesToSubpalettes(inputs, sharedTilePalettes)
     print('resultSubpalettes =', resultSubpalettes)
     print('resultMapping =', resultMapping)
     assert expectedSubpalettes and expectedMapping
@@ -408,3 +415,28 @@ def test_negative1():
         [7]
     ]
     _verifyFailure(inputs)
+
+def test_sharedtile1():
+    global MAX_COLOURS
+    MAX_COLOURS = 5
+    inputs = [
+        [1,4,5],
+        [4,5,6,7],
+        [1,2,3],
+        [1,2,5]
+    ]
+    sharedTilePalettes = [
+        [0,3]
+    ]
+    expectedSubpalettes = [
+        [1,4,5,6,7],
+        [1,2,3,5]
+    ]
+    expectedMapping = {
+        0:0,
+        1:0,
+        2:1,
+        3:1
+    }
+    _verifyTestData(inputs, expectedSubpalettes, expectedMapping, sharedTilePalettes)
+
